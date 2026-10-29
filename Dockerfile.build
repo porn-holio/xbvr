@@ -1,0 +1,52 @@
+# Self-contained build of the XBVR image (UI + Go binary + runtime).
+# Upstream's Dockerfile expects a binary prebuilt by goreleaser in CI; this one
+# builds everything from source so a patched image can be produced locally:
+#
+#   docker buildx build --platform linux/amd64,linux/arm64 -f Dockerfile.build \
+#     --build-arg VERSION=0.4.40 --build-arg COMMIT=$(git rev-parse --short HEAD) .
+
+# --- UI: architecture independent, so build once on the host platform ---
+FROM --platform=$BUILDPLATFORM node:20-bookworm AS ui
+WORKDIR /src
+COPY package.json yarn.lock ./
+RUN yarn install --ignore-engines --frozen-lockfile --network-timeout 600000
+COPY ui ./ui
+RUN yarn build
+
+# --- Go: CGO (sqlite) on the same Ubuntu release as the runtime, so glibc matches ---
+FROM ubuntu:22.04 AS go
+ARG GO_VERSION=1.25.3
+ARG TARGETARCH
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ca-certificates curl gcc libc6-dev git && \
+    rm -rf /var/lib/apt/lists/* && \
+    curl -fsSL https://go.dev/dl/go${GO_VERSION}.linux-${TARGETARCH}.tar.gz | tar -C /usr/local -xz
+ENV PATH=/usr/local/go/bin:$PATH CGO_ENABLED=1
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=ui /src/ui/dist ./ui/dist
+ARG VERSION=CURRENT
+ARG COMMIT=HEAD
+RUN go build -tags=json1 \
+    -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X 'main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)'" \
+    -o /out/xbvr .
+
+# --- Runtime: identical to upstream's Dockerfile ---
+FROM ubuntu:22.04
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends python3 ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=go /out/xbvr /usr/bin/xbvr
+# place data next to the executable like other platforms
+COPY xbvr_data/ /usr/bin/xbvr_data/
+COPY docker_start.sh /
+RUN chmod 777 /docker_start.sh
+
+EXPOSE 9998-9999
+VOLUME /root/.config/
+
+CMD ["/usr/bin/xbvr"]
